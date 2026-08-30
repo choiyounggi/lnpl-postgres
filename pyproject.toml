@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lnpl-postgres"
+version = "0.1.0"
+description = "PostgreSQL RepositoryDriver for lnpl (linkly#121)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "lnpl @ git+https://github.com/choiyounggi/linkly@60cbbafde47835d8f855baa076fdc70919a8f00c",
+    "psycopg[binary]>=3.2,<3.3",
+]
+
+[project.optional-dependencies]
+test = ["testcontainers[postgres]>=4.15,<5"]
+
+[project.entry-points."lnpl.drivers"]
+postgres = "lnpl_postgres:make_driver"
+
+[tool.setuptools]
+packages = ["lnpl_postgres"]
