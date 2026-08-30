@@ -42,6 +42,15 @@ pip install -e .[test]
 python -m unittest discover -s tests
 ```
 
+On macOS with Docker Desktop, Testcontainers' Ryuk reaper container can fail
+to start with a socket-mount error (`mount source path
+'.../.docker/run/docker.sock'`). If you hit that, disable Ryuk for the run
+(CI's `ubuntu-latest` runners don't need this):
+
+```
+TESTCONTAINERS_RYUK_DISABLED=true python -m unittest discover -s tests
+```
+
 ## Bumping the pinned lnpl commit
 
 This package depends on `lnpl` via a commit-SHA-pinned direct reference in
