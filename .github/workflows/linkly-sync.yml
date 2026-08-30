@@ -1,0 +1,66 @@
+name: linkly-sync
+
+# PR 게이트: 이 변경이 linkly와의 연동을 깨지 않는지 사전 체크한다.
+#
+# - pin-check: pyproject.toml이 고정한 linkly 커밋이 linkly main에서 여전히
+#   도달 가능한지 확인한다(rebase로 사라진 SHA면 설치가 언젠가 깨진다).
+#   pin이 main보다 얼마나 뒤처졌는지도 함께 보고한다.
+# - latest-main: pin 대신 linkly@main 최신으로 lnpl을 설치해 전체 테스트
+#   (Testcontainers TCK 포함)를 돌린다 — linkly 쪽이 움직였을 때 이 레포의
+#   변경이 그 최신과도 호환되는지, 머지 전에 확인한다.
+#
+# 기존 ci.yml은 pin 기준 검증을 그대로 담당한다. 두 워크플로가 함께 통과해야
+# "pin에서도, 최신 main에서도 동작한다"가 성립한다.
+
+on:
+  pull_request:
+
+jobs:
+  pin-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract pinned linkly commit
+        id: pin
+        run: |
+          PIN=$(grep -oE 'linkly@[0-9a-f]{40}' pyproject.toml | head -1 | cut -d@ -f2)
+          if [ -z "$PIN" ]; then
+            echo "::error::pyproject.toml에서 linkly 커밋 pin을 찾지 못했다 (lnpl @ git+...linkly@<40-hex sha> 형태여야 한다)"
+            exit 1
+          fi
+          echo "sha=$PIN" >> "$GITHUB_OUTPUT"
+      - name: Pin must be reachable from linkly main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ steps.pin.outputs.sha }}
+        run: |
+          COMPARE=$(gh api "repos/choiyounggi/linkly/compare/${PIN}...main") || {
+            echo "::error::linkly에서 pin ${PIN}을 찾지 못했다 — rebase로 사라진 SHA일 수 있다. 존재하는 커밋으로 pin을 옮겨라."
+            exit 1
+          }
+          STATUS=$(echo "$COMPARE" | jq -r .status)
+          AHEAD=$(echo "$COMPARE" | jq -r .ahead_by)
+          case "$STATUS" in
+            identical)
+              echo "pin ${PIN} == linkly main" ;;
+            ahead)
+              echo "::notice::pin ${PIN}은 linkly main보다 ${AHEAD}커밋 뒤처져 있다 (main의 조상이므로 유효). 크게 벌어지면 pin 갱신을 고려하라." ;;
+            *)
+              echo "::error::pin ${PIN}이 linkly main의 조상이 아니다 (compare status: ${STATUS}). 히스토리가 다시 쓰였다 — main에 있는 커밋으로 pin을 옮겨라."
+              exit 1 ;;
+          esac
+
+  latest-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install with linkly@main instead of the pin
+        run: |
+          pip install -e ".[test]"
+          pip install --upgrade --force-reinstall "lnpl @ git+https://github.com/choiyounggi/linkly@main"
+          python -c "import lnpl; print('lnpl', getattr(lnpl, '__version__', '?'), 'from linkly@main')"
+      - name: Run the full suite (TCK via Testcontainers) against linkly main
+        run: python -m unittest discover -s tests -v
