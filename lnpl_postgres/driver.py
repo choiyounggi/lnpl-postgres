@@ -16,6 +16,7 @@ from lnpl.drivers import (
     DriverError,
     READ_OPS,
     RepositoryDriver,
+    WriteConflictError,
 )
 
 _CREATE_TABLE = """
@@ -105,6 +106,10 @@ class PostgresRepositoryDriver(RepositoryDriver):
         self.dsn = dsn
         self._in_transaction = False
         self._sql_transaction_open = False
+        # linkly#182 mirror: the exact _VersionedRow execute()'s `read`
+        # branch last handed out per (entity_id, key), so _touch's `update`
+        # can advance ITS observed_version too (last read under a key wins).
+        self._bound_rows = {}
         try:
             self._conn = psycopg.connect(dsn)
             self._conn.autocommit = True
@@ -171,7 +176,12 @@ class PostgresRepositoryDriver(RepositoryDriver):
 
     def execute(self, entity_id, operation, key):
         if operation in READ_OPS:
-            return self._read(entity_id, key)
+            row = self._read(entity_id, key)
+            if operation == "read" and row is not None:
+                # linkly#182 mirror: register here, never inside `_read`,
+                # which `_touch` also calls for its own throwaway read.
+                self._bound_rows[(entity_id, key)] = row
+            return row
         if operation == "create":
             return self._create(entity_id, key)
         if operation in ("update", "delete"):
@@ -233,9 +243,13 @@ class PostgresRepositoryDriver(RepositoryDriver):
                 # becomes a RunError and the run is decided failed.
                 if not self._in_transaction:
                     self._conn.execute("ROLLBACK")
-                raise DriverError(
+                raise WriteConflictError(
                     "write conflict: row changed since read (%s %s)"
                     % (entity_id, key))
+            # linkly#174 mirror: the UPDATE above bumped `_version`, so the
+            # row this caller holds is now one version behind -- advance it,
+            # or a second `set` on the same binding is a phantom conflict.
+            row.observed_version = version + 1
             self._end_write()
         except psycopg.Error as exc:
             raise DriverError("cannot persist %s: %s" % (entity_id, exc)) from exc
@@ -310,4 +324,11 @@ class PostgresRepositoryDriver(RepositoryDriver):
             self._end_write()
         except psycopg.Error as exc:
             raise DriverError("cannot %s %s: %s" % (operation, entity_id, exc)) from exc
+        if operation == "update" and cursor.rowcount > 0:
+            # linkly#182 mirror: this UPDATE bumped `_version`; advance the
+            # row this run already has bound for the key (if any) so its
+            # next `persist` is not mistaken for a concurrent write.
+            bound = self._bound_rows.get((entity_id, key))
+            if bound is not None:
+                bound.observed_version += 1
         return {"affected": cursor.rowcount if cursor.rowcount >= 0 else 0}
