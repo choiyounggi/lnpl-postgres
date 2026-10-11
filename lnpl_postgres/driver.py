@@ -4,11 +4,15 @@ STATEMENT TEXT IS CONSTANT (lnpl.drivers module docstring): every SQL string
 below is a literal; every value that varies rides in as a bound parameter.
 """
 
+import atexit
 import json
+import os
+import threading
 import time
 
 import psycopg
 import psycopg.errors
+import psycopg_pool
 
 from lnpl.drivers import (
     ACCEPTED_OPS,
@@ -88,9 +92,97 @@ class _VersionedRow(dict):
         self.observed_version = version
 
 
+# Issue #4: `lnpl serve` builds one driver per request, so a driver that
+# opened its own connection made one server connection per request, and
+# under load the connections piled up (`too many clients already`). Each
+# driver now borrows from one pool per DSN for its lifetime and returns the
+# connection in `close()`, so the server-side count stays at most max_size.
+_POOL_DEFAULTS = {"min_size": 2, "max_size": 20, "timeout": 10}
+# dsn -> (pid that built the pool, pool). A pool inherited across fork()
+# has no worker threads and shares sockets with its parent, so a process
+# only ever uses (and closes) the pools it built itself.
+_POOLS = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _pool_setting(name):
+    """`LNPL_PG_POOL_<NAME>` from the environment, or the default; refused
+    with ValueError unless it is a whole number in range."""
+    env = "LNPL_PG_POOL_" + name.upper()
+    raw = os.environ.get(env)
+    if raw is None or not raw.strip():
+        return _POOL_DEFAULTS[name]
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("%s must be a whole number, got %r" % (env, raw)) from None
+    floor = 0 if name == "min_size" else 1
+    if value < floor:
+        raise ValueError("%s must be at least %d, got %d" % (env, floor, value))
+    return value
+
+
+def _pool_for(dsn):
+    """The process-wide pool for `dsn`, built on first use. Before building
+    it, one plain connect proves the DSN reachable, so a bad DSN fails fast
+    with DriverError instead of after the pool's wait timeout."""
+    pid = os.getpid()
+    with _POOLS_LOCK:
+        entry = _POOLS.get(dsn)
+    if entry is not None and entry[0] == pid:
+        return entry[1]
+    min_size = _pool_setting("min_size")
+    max_size = _pool_setting("max_size")
+    timeout = _pool_setting("timeout")
+    if min_size > max_size:
+        raise ValueError(
+            "LNPL_PG_POOL_MIN_SIZE (%d) must not exceed LNPL_PG_POOL_MAX_SIZE (%d)"
+            % (min_size, max_size))
+    # Network I/O stays outside the lock, so one slow host never stalls
+    # lookups of the pools already built for other DSNs.
+    try:
+        psycopg.connect(dsn).close()
+    except psycopg.Error as exc:
+        raise DriverError("cannot open the postgres store at %r: %s"
+                          % (dsn, exc)) from exc
+    pool = psycopg_pool.ConnectionPool(
+        dsn, min_size=min_size, max_size=max_size, timeout=timeout,
+        kwargs={"autocommit": True},
+        check=psycopg_pool.ConnectionPool.check_connection,
+        name="lnpl-postgres", open=True)
+    with _POOLS_LOCK:
+        entry = _POOLS.get(dsn)
+        if entry is None or entry[0] != pid:
+            _POOLS[dsn] = (pid, pool)
+            return pool
+    pool.close()  # another thread of this process built one first
+    return entry[1]
+
+
+@atexit.register
+def _close_pools():
+    pid = os.getpid()
+    with _POOLS_LOCK:
+        pools = [pool for owner, pool in _POOLS.values() if owner == pid]
+        _POOLS.clear()
+    for pool in pools:
+        pool.close()
+
+
+def _after_fork_in_child():
+    # The child must not wait on a lock some other parent thread held at
+    # fork time; inherited pools are skipped by the pid check above.
+    global _POOLS_LOCK
+    _POOLS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 class PostgresRepositoryDriver(RepositoryDriver):
-    """A postgres-backed repository. One connection, always autocommit for
-    reads; a SQL transaction is opened explicitly (`BEGIN`) only around a
+    """A postgres-backed repository. One connection borrowed from the DSN's
+    pool for the driver's lifetime (issue #4), always autocommit for reads; a SQL transaction is opened explicitly (`BEGIN`) only around a
     write, never via `psycopg`'s own `conn.commit()`/`conn.rollback()`/
     `conn.transaction()` (the latter allows nested SAVEPOINTs, which this
     driver's own 2-flag boundary tracking does not want)."""
@@ -110,12 +202,25 @@ class PostgresRepositoryDriver(RepositoryDriver):
         # branch last handed out per (entity_id, key), so _touch's `update`
         # can advance ITS observed_version too (last read under a key wins).
         self._bound_rows = {}
+        self._conn = None
+        self._pool = _pool_for(dsn)
         try:
-            self._conn = psycopg.connect(dsn)
-            self._conn.autocommit = True
+            self._conn = self._pool.getconn()
+        except psycopg_pool.PoolTimeout as exc:
+            stats = self._pool.get_stats()
+            if stats.get("pool_size", 0) >= self._pool.max_size \
+                    and stats.get("pool_available", 0) == 0:
+                reason = ("all %d pooled connections stayed in use "
+                          "(LNPL_PG_POOL_MAX_SIZE)" % self._pool.max_size)
+            else:
+                reason = "the postgres server could not be reached"
+            raise DriverError("no postgres connection within %ss: %s"
+                              % (self._pool.timeout, reason)) from exc
+        try:
             self._conn.execute(_CREATE_TABLE)
             self._conn.execute(_CREATE_OUTBOX_TABLE)
         except psycopg.Error as exc:
+            self.close()
             raise DriverError("cannot open the postgres store at %r: %s"
                               % (dsn, exc)) from exc
 
@@ -280,7 +385,11 @@ class PostgresRepositoryDriver(RepositoryDriver):
     def close(self):
         conn, self._conn = getattr(self, "_conn", None), None
         if conn is not None:
-            conn.close()
+            # The pool rolls back a connection returned inside a
+            # transaction (an un-committed run) before lending it again.
+            self._in_transaction = False
+            self._sql_transaction_open = False
+            self._pool.putconn(conn)
 
     # -- internals -------------------------------------------------------------
 
