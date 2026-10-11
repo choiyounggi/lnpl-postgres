@@ -11,7 +11,7 @@ license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
     "lnpl @ git+https://github.com/choiyounggi/linkly@c9d35a295941d54b99d24dc221877fbee54ccabe",
-    "psycopg[binary]>=3.2,<3.3",
+    "psycopg[binary,pool]>=3.2,<3.3",
 ]
 
 [project.optional-dependencies]

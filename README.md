@@ -33,6 +33,29 @@ unparsed:
 --backend "postgres:host=localhost dbname=app"
 ```
 
+## Connection pool
+
+`lnpl serve` builds one driver per request. Each driver borrows a connection
+from a pool shared by every driver with the same DSN in the process, and
+returns it when the driver is closed. So the number of server connections
+one process holds never goes above the pool's maximum, however many requests
+arrive at once (issue #4). A connection returned in the middle of an
+uncommitted transaction is rolled back before it is lent again.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `LNPL_PG_POOL_MIN_SIZE` | `2` | connections kept open while idle (`0` allowed) |
+| `LNPL_PG_POOL_MAX_SIZE` | `20` | most connections this process opens to one DSN |
+| `LNPL_PG_POOL_TIMEOUT` | `10` | seconds a driver waits for a free connection before failing with `DriverError` |
+
+The values are read once, when the first driver for a DSN is created, and
+must be whole numbers (`MIN_SIZE` at most `MAX_SIZE`; `MAX_SIZE` and
+`TIMEOUT` at least 1), otherwise `ValueError`. With several server processes
+(for example gunicorn workers), each has its own pool, so keep
+`processes × LNPL_PG_POOL_MAX_SIZE` below the server's `max_connections`
+(100 in the stock image). The pool is built lazily in each process, so it
+works with gunicorn's default fork model; do not use `--preload`.
+
 ## Local testing
 
 Requires Docker (used by Testcontainers to spin up a real Postgres instance).
