@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
-    "lnpl @ git+https://github.com/choiyounggi/linkly@c9d35a295941d54b99d24dc221877fbee54ccabe",
+    "lnpl @ git+https://github.com/choiyounggi/linkly@b1cd52354df6d935286f8dc089b9ee1bcb87e673",
     "psycopg[binary,pool]>=3.2,<3.3",
 ]
 

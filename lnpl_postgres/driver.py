@@ -5,6 +5,7 @@ below is a literal; every value that varies rides in as a bound parameter.
 """
 
 import atexit
+import contextlib
 import json
 import os
 import threading
@@ -75,6 +76,57 @@ _INSERT_OUTBOX = (
 _SELECT_OUTBOX_SINCE = (
     "SELECT seq, emission_id, event, payload, created_at "
     "FROM lnpl_outbox WHERE event = %s AND seq > %s ORDER BY seq")
+
+# issue #113, r1: `(workflow_id, key)` claims a slot the moment a request
+# with that `Idempotency-Key` arrives -- INSERTed and committed immediately,
+# so a genuinely concurrent second request with the same key sees it right
+# away (`idempotency_begin` below). The final disposition (`http_status`/
+# `body`) is written by a SEPARATE statement, AFTER `run_workflow` returns,
+# deliberately outside that execution's own commit/rollback boundary: the
+# plan first had this row's whole lifecycle living inside that boundary, but
+# `run_workflow` calls `self.repo.rollback()` unconditionally on any failure
+# (`interp.py`), and a rollback there would undo the finalizing UPDATE and
+# revert the row to `in-progress` forever -- worse than not having the
+# feature. `status` is `in-progress` or `done`; `done` is what a later
+# request replays regardless of whether the run it recorded succeeded or
+# failed (Stripe's contract: a same-key retry gets back the SAME result,
+# never a second execution).
+# Postgres: there is no autonomous transaction, so "outside that boundary"
+# means "on a connection that is not inside it". While this driver's own
+# SQL transaction is open (`_sql_transaction_open`), the idempotency
+# statements run on a second connection borrowed from the same pool
+# (`_idempotency_connection`); otherwise on the driver's own connection,
+# which is autocommit, so each statement commits itself. `created_at` is
+# the caller's epoch-millisecond `now_ms`, never the server's clock.
+_CREATE_IDEMPOTENCY_TABLE = """
+CREATE TABLE IF NOT EXISTS lnpl_idempotency (
+    key         TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    http_status INTEGER,
+    body        TEXT,
+    created_at  BIGINT NOT NULL,
+    PRIMARY KEY (workflow_id, key)
+)
+"""
+# Lazy TTL sweep, one key: the row goes only if it is already expired
+# (`created_at <= now_ms - ttl_ms`, i.e. NOT `now_ms - created_at < ttl_ms`),
+# so a concurrent caller's fresh claim is never deleted.
+_DELETE_EXPIRED_IDEMPOTENCY = (
+    "DELETE FROM lnpl_idempotency "
+    "WHERE workflow_id = %s AND key = %s AND created_at <= %s")
+_INSERT_IDEMPOTENCY_CLAIM = (
+    "INSERT INTO lnpl_idempotency (key, workflow_id, status, created_at) "
+    "VALUES (%s, %s, 'in-progress', %s) "
+    "ON CONFLICT (workflow_id, key) DO NOTHING")
+_SELECT_IDEMPOTENCY = (
+    "SELECT status, http_status, body FROM lnpl_idempotency "
+    "WHERE workflow_id = %s AND key = %s")
+_UPDATE_IDEMPOTENCY_DONE = (
+    "UPDATE lnpl_idempotency SET status = 'done', http_status = %s, body = %s "
+    "WHERE workflow_id = %s AND key = %s")
+_DELETE_IDEMPOTENCY = (
+    "DELETE FROM lnpl_idempotency WHERE workflow_id = %s AND key = %s")
 
 
 def _encode(row):
@@ -219,6 +271,7 @@ class PostgresRepositoryDriver(RepositoryDriver):
         try:
             self._conn.execute(_CREATE_TABLE)
             self._conn.execute(_CREATE_OUTBOX_TABLE)
+            self._conn.execute(_CREATE_IDEMPOTENCY_TABLE)
         except psycopg.Error as exc:
             self.close()
             raise DriverError("cannot open the postgres store at %r: %s"
@@ -382,6 +435,63 @@ class PostgresRepositoryDriver(RepositoryDriver):
                 "payload": row[3], "created_at": row[4]}
                for row in found]
 
+    def idempotency_begin(self, workflow_id, key, now_ms, ttl_ms):
+        """Claim `(workflow_id, key)` -- issue #113, r1. Two outcomes ask the
+        caller to run nothing: `("in-progress", None)` (someone else owns
+        this key right now -- 409) or `("done", (http_status, body))` (a
+        prior run already finished -- replay it, whether it succeeded or
+        failed). `("started", None)` means this call just claimed the key
+        and the caller should run the workflow.
+
+        Postgres: see the comment above `_CREATE_IDEMPOTENCY_TABLE` for which
+        connection runs these statements.
+        """
+        try:
+            with self._idempotency_connection() as conn:
+                return self._claim_idempotency(conn, workflow_id, key,
+                                               now_ms, ttl_ms)
+        except psycopg.Error as exc:
+            # Only borrowing the side connection lands here; every statement
+            # in `_claim_idempotency` maps its own error.
+            raise DriverError("cannot claim idempotency key %r: %s"
+                              % (key, exc)) from exc
+
+    def idempotency_finish(self, workflow_id, key, http_status, body):
+        """Record the final disposition -- a SEPARATE statement, issued
+        AFTER `run_workflow` returns (issue #113, r1). Deliberately outside
+        that execution's own commit/rollback boundary: `run_workflow` calls
+        `self.repo.rollback()` unconditionally on any failure, and writing
+        this finalize step INSIDE that boundary would have a failed run's
+        rollback undo it too -- reverting the row to `in-progress` forever,
+        which blocks every future retry instead of replaying the failure
+        (docs/serving.md's idempotency section)."""
+        encoded = json.dumps(body)
+        try:
+            with self._idempotency_connection() as conn:
+                conn.execute(_UPDATE_IDEMPOTENCY_DONE,
+                             (http_status, encoded, workflow_id, key))
+        except psycopg.Error as exc:
+            raise DriverError("cannot record idempotency result for %r: %s"
+                              % (key, exc)) from exc
+
+    def idempotency_release(self, workflow_id, key):
+        """Abandon an in-progress claim -- issue #118, D6 r2. A SEPARATE,
+        immediately-committed DELETE (same style as `idempotency_begin`/
+        `idempotency_finish` above), for exactly the outcome neither of
+        those two covers: a run that ended in a state the caller wants
+        RETRIED, not replayed and not left to self-heal via the TTL.
+
+        A DELETE against a key with no row (already released, never
+        claimed, or already finished) matches zero rows and raises
+        nothing -- release is idempotent, a no-op on an absent claim.
+        """
+        try:
+            with self._idempotency_connection() as conn:
+                conn.execute(_DELETE_IDEMPOTENCY, (workflow_id, key))
+        except psycopg.Error as exc:
+            raise DriverError("cannot release idempotency key %r: %s"
+                              % (key, exc)) from exc
+
     def close(self):
         conn, self._conn = getattr(self, "_conn", None), None
         if conn is not None:
@@ -392,6 +502,52 @@ class PostgresRepositoryDriver(RepositoryDriver):
             self._pool.putconn(conn)
 
     # -- internals -------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _idempotency_connection(self):
+        """The connection the idempotency statements run on: the driver's
+        own (autocommit) one while no SQL transaction is open, otherwise a
+        second one borrowed from the same pool, so the statement commits
+        outside the open transaction and its `rollback()` cannot undo it."""
+        if self._sql_transaction_open:
+            with self._pool.connection() as side:
+                yield side
+        else:
+            yield self._conn
+
+    def _claim_idempotency(self, conn, workflow_id, key, now_ms, ttl_ms):
+        try:
+            conn.execute(_DELETE_EXPIRED_IDEMPOTENCY,
+                         (workflow_id, key, now_ms - ttl_ms))
+        except psycopg.Error as exc:
+            raise DriverError("cannot clear expired idempotency key %r: %s"
+                              % (key, exc)) from exc
+        try:
+            cursor = conn.execute(_INSERT_IDEMPOTENCY_CLAIM,
+                                  (key, workflow_id, now_ms))
+        except psycopg.Error as exc:
+            raise DriverError("cannot claim idempotency key %r: %s"
+                              % (key, exc)) from exc
+        if cursor.rowcount == 1:
+            return "started", None
+        # The key has a row. Unlike sqlite (whose lost race answers
+        # `in-progress` without reading), read it back: a `done` row is
+        # replayed, which is what the contract asks for a recorded result.
+        try:
+            row = conn.execute(_SELECT_IDEMPOTENCY,
+                               (workflow_id, key)).fetchone()
+        except psycopg.Error as exc:
+            raise DriverError("cannot read idempotency key %r: %s"
+                              % (key, exc)) from exc
+        if row is None or row[0] != "done":
+            # A live claim owned by another request, or a row released
+            # between the INSERT and this read -- either way this caller
+            # must not run the workflow. No age check is needed: the
+            # DELETE above already removed this key's expired row.
+            return "in-progress", None
+        status, http_status, body = row
+        return "done", (http_status,
+                        json.loads(body) if body is not None else None)
 
     def _read(self, entity_id, key):
         try:
