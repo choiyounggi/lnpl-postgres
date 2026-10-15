@@ -56,6 +56,56 @@ must be whole numbers (`MIN_SIZE` at most `MAX_SIZE`; `MAX_SIZE` and
 (100 in the stock image). The pool is built lazily in each process, so it
 works with gunicorn's default fork model; do not use `--preload`.
 
+## Idempotency-Key
+
+`lnpl serve` honours the `Idempotency-Key` request header on this backend:
+the driver implements `idempotency_begin`, `idempotency_finish` and
+`idempotency_release`. Claims live in the table `lnpl_idempotency`, keyed by
+`(workflow_id, key)` and created by the first driver for a DSN with
+`CREATE TABLE IF NOT EXISTS`, so there is no separate migration step.
+
+A claim is committed the moment it is made. The recorded status and body are
+committed on their own, outside the workflow's transaction, so a run that
+fails and rolls back still leaves its result for the next request with the
+same key to replay.
+
+A claim older than `lnpl serve`'s idempotency TTL (`LNPL_IDEMPOTENCY_TTL_S`,
+default 24 hours) is deleted the next time the same key is claimed. Rows of
+keys that are never sent again stay in the table; `created_at` is epoch
+milliseconds, so they can be pruned with, for example,
+`DELETE FROM lnpl_idempotency WHERE created_at < <epoch milliseconds>`.
+
+If one of these methods is called while the same driver still has a
+workflow transaction open, it borrows a second connection from the pool, so
+its write is not undone when that transaction rolls back. In `lnpl serve`
+this happens only when an event delivery's workflow raised an unexpected
+error that left its transaction open and the server then releases that
+delivery's claim. If the pool has no free connection at that moment (always
+the case with `LNPL_PG_POOL_MAX_SIZE=1`, and with any size once every
+connection is in use), that release fails with `DriverError` after
+`LNPL_PG_POOL_TIMEOUT` seconds and the key stays in progress until the
+idempotency TTL clears it.
+
+## Outbox drain and relay
+
+`lnpl outbox drain`, `lnpl outbox ack` and
+`lnpl relay <source> --backend postgres:<dsn> --target <url>` work on this
+backend: the driver implements `drain_outbox` and `ack_outbox`, so
+`supports_outbox_drain()` is True. A drain lists the rows of `lnpl_outbox`
+whose `delivered_at` is empty, lowest `seq` first. An ack sets `delivered_at`
+(epoch milliseconds) and never deletes the row. Acking a seq that is already
+delivered does nothing and succeeds; a batch that names a seq with no row is
+refused as a whole and marks nothing.
+
+A drain locks the rows it returns with `FOR UPDATE SKIP LOCKED`. The `lnpl`
+commands call it outside any transaction, so that lock ends as soon as the
+drain returns: two `lnpl relay` processes on one database can both send the
+same row. That is the at-least-once contract; each event's CloudEvents `id` is
+`outbox-<seq>`, so a receiver can drop repeats. Code that calls `begin()`
+before `drain_outbox()` keeps the drained rows locked until its `commit()` or
+`rollback()`: other drainers skip those rows, and an ack of them from another
+connection waits until that transaction ends.
+
 ## Local testing
 
 Requires Docker (used by Testcontainers to spin up a real Postgres instance).
@@ -82,3 +132,8 @@ rather than `@main`, since linkly's `main` branch moves frequently across
 parallel sessions and an unpinned dependency could break CI without warning.
 To pick up a newer `lnpl`, replace `<sha>` in the `dependencies` entry with
 the target commit SHA from the `linkly` repository and re-run the test suite.
+
+The current pin is `b1cd52354df6d935286f8dc089b9ee1bcb87e673` (lnpl 0.8.0,
+linkly PR #256). It is the first linkly `main` commit with
+`RepositoryDriver.supports_idempotency()` and the `RepositoryDriverTCK` cases
+that check the idempotency methods, so an older pin cannot verify them.
