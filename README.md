@@ -86,6 +86,26 @@ connection is in use), that release fails with `DriverError` after
 `LNPL_PG_POOL_TIMEOUT` seconds and the key stays in progress until the
 idempotency TTL clears it.
 
+## Outbox drain and relay
+
+`lnpl outbox drain`, `lnpl outbox ack` and
+`lnpl relay <source> --backend postgres:<dsn> --target <url>` work on this
+backend: the driver implements `drain_outbox` and `ack_outbox`, so
+`supports_outbox_drain()` is True. A drain lists the rows of `lnpl_outbox`
+whose `delivered_at` is empty, lowest `seq` first. An ack sets `delivered_at`
+(epoch milliseconds) and never deletes the row. Acking a seq that is already
+delivered does nothing and succeeds; a batch that names a seq with no row is
+refused as a whole and marks nothing.
+
+A drain locks the rows it returns with `FOR UPDATE SKIP LOCKED`. The `lnpl`
+commands call it outside any transaction, so that lock ends as soon as the
+drain returns: two `lnpl relay` processes on one database can both send the
+same row. That is the at-least-once contract; each event's CloudEvents `id` is
+`outbox-<seq>`, so a receiver can drop repeats. Code that calls `begin()`
+before `drain_outbox()` keeps the drained rows locked until its `commit()` or
+`rollback()`: other drainers skip those rows, and an ack of them from another
+connection waits until that transaction ends.
+
 ## Local testing
 
 Requires Docker (used by Testcontainers to spin up a real Postgres instance).

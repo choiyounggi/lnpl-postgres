@@ -77,6 +77,25 @@ _SELECT_OUTBOX_SINCE = (
     "SELECT seq, emission_id, event, payload, created_at "
     "FROM lnpl_outbox WHERE event = %s AND seq > %s ORDER BY seq")
 
+# issue #8 (t2): the drain/ack consumer's statements. `delivered_at` is that
+# consumer's column alone (`read_outbox` ignores it); a row is marked, never
+# deleted. A bound `LIMIT NULL` means no limit, so one statement serves
+# `drain_outbox(limit=None)` and `drain_outbox(limit=n)`. `FOR UPDATE SKIP
+# LOCKED`: rows another open transaction has drained are skipped, not waited
+# on; the lock lasts until this connection's transaction ends -- the
+# statement itself outside a workflow transaction (autocommit), the
+# workflow's commit()/rollback() inside one.
+_SELECT_UNDELIVERED = (
+    "SELECT seq, emission_id, event, payload, created_at FROM lnpl_outbox "
+    "WHERE delivered_at IS NULL ORDER BY seq LIMIT %s FOR UPDATE SKIP LOCKED")
+_SELECT_OUTBOX_SEQS = "SELECT seq FROM lnpl_outbox WHERE seq = ANY(%s)"
+# The `delivered_at IS NULL` guard makes a re-ack idempotent without a second
+# read (sqlite `_MARK_DELIVERED`): an already-delivered seq matches zero rows
+# and keeps the delivered_at its first ack set.
+_MARK_DELIVERED = (
+    "UPDATE lnpl_outbox SET delivered_at = %s "
+    "WHERE seq = ANY(%s) AND delivered_at IS NULL")
+
 # issue #113, r1: `(workflow_id, key)` claims a slot the moment a request
 # with that `Idempotency-Key` arrives -- INSERTed and committed immediately,
 # so a genuinely concurrent second request with the same key sees it right
@@ -434,6 +453,66 @@ class PostgresRepositoryDriver(RepositoryDriver):
         return [{"seq": row[0], "emission_id": row[1], "event": row[2],
                 "payload": row[3], "created_at": row[4]}
                for row in found]
+
+    def drain_outbox(self, limit=None):
+        """Every undelivered emission, `seq` ascending, as dicts shaped like
+        `read_outbox`'s rows; `[]` when there is none, never `None`. `limit`
+        caps the batch; a negative `limit` means no cap (sqlite parity).
+
+        The rows returned are locked `FOR UPDATE SKIP LOCKED` on this
+        driver's own connection. Outside a workflow transaction that
+        connection is autocommit, so the lock ends with the statement and a
+        second drain lists the same rows until they are acked (at-least-once).
+        Inside one (`begin()` ... `commit()`/`rollback()`) the drain opens
+        the SQL transaction, so the rows stay locked -- and other drainers
+        skip them -- until that transaction ends."""
+        if limit is not None and limit < 0:
+            limit = None
+        try:
+            self._ensure_sql_transaction()
+            found = self._conn.execute(_SELECT_UNDELIVERED, (limit,)).fetchall()
+        except psycopg.Error as exc:
+            raise DriverError("cannot drain outbox: %s" % exc) from exc
+        return [{"seq": row[0], "emission_id": row[1], "event": row[2],
+                "payload": row[3], "created_at": row[4]}
+               for row in found]
+
+    def ack_outbox(self, seqs):
+        """Mark every seq in `seqs` delivered (`delivered_at` = now, epoch
+        milliseconds). Fails closed: if any seq names no row, DriverError
+        before anything is written, so the known seqs in the batch stay
+        undelivered too. A seq already delivered is a no-op success
+        (idempotent re-ack).
+
+        The check and the write share one transaction on this driver's own
+        connection: its own BEGIN ... COMMIT outside a workflow transaction,
+        the workflow's inside one -- never a side connection, which would
+        wait on the row locks a drain in that transaction holds."""
+        seqs = list(seqs)  # psycopg adapts a list as an array, a tuple not
+        own = not self._in_transaction
+        try:
+            if own:
+                self._conn.execute("BEGIN")
+            else:
+                self._ensure_sql_transaction()
+            try:
+                found = {row[0] for row in self._conn.execute(
+                    _SELECT_OUTBOX_SEQS, (seqs,)).fetchall()}
+                missing = [seq for seq in seqs if seq not in found]
+                if missing:
+                    raise DriverError("outbox ack: unknown seq(s): %s"
+                                      % ", ".join(str(seq) for seq in missing))
+                self._conn.execute(_MARK_DELIVERED,
+                                   (int(time.time() * 1000), seqs))
+            except Exception:
+                if own:
+                    self._conn.execute("ROLLBACK")
+                raise
+            if own:
+                self._conn.execute("COMMIT")
+            self._end_write()
+        except psycopg.Error as exc:
+            raise DriverError("cannot ack outbox: %s" % exc) from exc
 
     def idempotency_begin(self, workflow_id, key, now_ms, ttl_ms):
         """Claim `(workflow_id, key)` -- issue #113, r1. Two outcomes ask the

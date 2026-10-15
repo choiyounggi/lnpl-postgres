@@ -79,11 +79,11 @@ class PostgresIdempotencyTest(unittest.TestCase):
 
     # -- capability and schema ------------------------------------------------
 
-    def test_driver_declares_idempotency_and_not_outbox_drain(self):
+    def test_driver_declares_idempotency_and_outbox_drain(self):
         self.assertEqual((self.driver.supports_idempotency(),
-                          self.driver.supports_outbox_drain()), (True, False))
-        self.assertFalse(hasattr(self.driver, "drain_outbox"))
-        self.assertFalse(hasattr(self.driver, "ack_outbox"))
+                          self.driver.supports_outbox_drain()), (True, True))
+        self.assertTrue(hasattr(self.driver, "drain_outbox"))
+        self.assertTrue(hasattr(self.driver, "ack_outbox"))
 
     def test_two_drivers_create_the_table_once_with_the_reference_columns(self):
         self.open_driver()
