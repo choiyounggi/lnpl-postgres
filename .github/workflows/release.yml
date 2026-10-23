@@ -1,0 +1,69 @@
+name: release
+
+# 태그 v<version>을 push하면 테스트 → sdist/wheel 빌드 → PyPI 게시(Trusted
+# Publishing) 순으로 돈다. 앞 잡이 실패하면 게시는 돌지 않는다.
+#
+# PyPI 쪽 등록값(pending publisher): project lnpl-postgres, owner choiyounggi,
+# repository lnpl-postgres, workflow release.yml, environment pypi.
+# PyPI 버전은 지우거나 다시 올릴 수 없다. 게시가 외부 원인(PyPI 장애, 등록 누락)
+# 으로 실패했으면 `gh run rerun <id> --failed`로 그 잡만 다시 돌리고, 레포 쪽
+# 원인이면 main에서 고친 뒤 다음 패치 버전으로 새로 태그한다. 태그는 지우거나
+# 다시 push하지 않는다.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Tag matches the pyproject version
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches pyproject.toml version $version"
+      - run: pip install -e ".[test]"
+      - run: python -m unittest discover -s tests -v
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI (Trusted Publishing)
+    needs: build
+    environment: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -2,53 +2,32 @@ name: linkly-sync
 
 # PR 게이트: 이 변경이 linkly와의 연동을 깨지 않는지 사전 체크한다.
 #
-# - pin-check: pyproject.toml이 고정한 linkly 커밋이 linkly main에서 여전히
-#   도달 가능한지 확인한다(rebase로 사라진 SHA면 설치가 언젠가 깨진다).
-#   pin이 main보다 얼마나 뒤처졌는지도 함께 보고한다.
-# - latest-main: pin 대신 linkly@main 최신으로 lnpl을 설치해 전체 테스트
-#   (Testcontainers TCK 포함)를 돌린다 — linkly 쪽이 움직였을 때 이 레포의
-#   변경이 그 최신과도 호환되는지, 머지 전에 확인한다.
+# - latest-release: pyproject.toml의 lnpl 버전 범위가 PyPI의 최신 lnpl 릴리스를
+#   포함하는지 확인한다(scripts/check_lnpl_range.py). linkly가 범위 밖의 새
+#   마이너를 내면 여기서 실패한다 — 범위를 넓히고 그 버전으로 테스트한 뒤
+#   릴리스하라는 신호다. 테스트 자체는 ci.yml이 범위 안의 최신 릴리스를 설치해
+#   돌리므로, 둘이 함께 통과하면 "최신 릴리스에서 동작한다"가 성립한다.
+# - latest-main: 릴리스 대신 linkly@main 최신으로 lnpl을 설치해 전체 테스트
+#   (Testcontainers TCK 포함)를 돌린다 — 다음 linkly 릴리스에 들어갈 변경과도
+#   호환되는지, 머지 전에 확인한다.
 #
-# 기존 ci.yml은 pin 기준 검증을 그대로 담당한다. 두 워크플로가 함께 통과해야
-# "pin에서도, 최신 main에서도 동작한다"가 성립한다.
+# 두 축(최신 릴리스, 최신 main)이 함께 통과해야 "지금 배포된 lnpl에서도, 다음
+# lnpl에서도 동작한다"가 성립한다.
 
 on:
   pull_request:
 
 jobs:
-  pin-check:
+  latest-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Extract pinned linkly commit
-        id: pin
-        run: |
-          PIN=$(grep -oE 'linkly@[0-9a-f]{40}' pyproject.toml | head -1 | cut -d@ -f2)
-          if [ -z "$PIN" ]; then
-            echo "::error::pyproject.toml에서 linkly 커밋 pin을 찾지 못했다 (lnpl @ git+...linkly@<40-hex sha> 형태여야 한다)"
-            exit 1
-          fi
-          echo "sha=$PIN" >> "$GITHUB_OUTPUT"
-      - name: Pin must be reachable from linkly main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PIN: ${{ steps.pin.outputs.sha }}
-        run: |
-          COMPARE=$(gh api "repos/choiyounggi/linkly/compare/${PIN}...main") || {
-            echo "::error::linkly에서 pin ${PIN}을 찾지 못했다 — rebase로 사라진 SHA일 수 있다. 존재하는 커밋으로 pin을 옮겨라."
-            exit 1
-          }
-          STATUS=$(echo "$COMPARE" | jq -r .status)
-          AHEAD=$(echo "$COMPARE" | jq -r .ahead_by)
-          case "$STATUS" in
-            identical)
-              echo "pin ${PIN} == linkly main" ;;
-            ahead)
-              echo "::notice::pin ${PIN}은 linkly main보다 ${AHEAD}커밋 뒤처져 있다 (main의 조상이므로 유효). 크게 벌어지면 pin 갱신을 고려하라." ;;
-            *)
-              echo "::error::pin ${PIN}이 linkly main의 조상이 아니다 (compare status: ${STATUS}). 히스토리가 다시 쓰였다 — main에 있는 커밋으로 pin을 옮겨라."
-              exit 1 ;;
-          esac
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install packaging
+      - name: lnpl range must admit the latest lnpl release
+        run: python scripts/check_lnpl_range.py pyproject.toml
 
   latest-main:
     runs-on: ubuntu-latest
@@ -57,7 +36,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install with linkly@main instead of the pin
+      - name: Install with linkly@main instead of the released lnpl
         run: |
           pip install -e ".[test]"
           pip install --upgrade --force-reinstall "lnpl @ git+https://github.com/choiyounggi/linkly@main"

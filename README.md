@@ -8,12 +8,13 @@ under the `lnpl.drivers` entry-point group as `postgres`.
 
 ## Install
 
-This package is GitHub-only (not published to PyPI) because it pins `lnpl`
-via a PEP 508 direct reference to a specific commit SHA, which PyPI rejects.
+```
+pip install lnpl-postgres
+```
 
-```
-pip install git+https://github.com/choiyounggi/lnpl-postgres@main
-```
+This also installs a matching `lnpl` from PyPI. To try unreleased changes,
+install from `main` instead:
+`pip install git+https://github.com/choiyounggi/lnpl-postgres@main`.
 
 ## Usage
 
@@ -124,16 +125,30 @@ to start with a socket-mount error (`mount source path
 TESTCONTAINERS_RYUK_DISABLED=true python -m unittest discover -s tests
 ```
 
-## Bumping the pinned lnpl commit
+## Supported lnpl versions
 
-This package depends on `lnpl` via a commit-SHA-pinned direct reference in
-`pyproject.toml` (`lnpl @ git+https://github.com/choiyounggi/linkly@<sha>`)
-rather than `@main`, since linkly's `main` branch moves frequently across
-parallel sessions and an unpinned dependency could break CI without warning.
-To pick up a newer `lnpl`, replace `<sha>` in the `dependencies` entry with
-the target commit SHA from the `linkly` repository and re-run the test suite.
-
-The current pin is `b1cd52354df6d935286f8dc089b9ee1bcb87e673` (lnpl 0.8.0,
-linkly PR #256). It is the first linkly `main` commit with
+This package depends on `lnpl>=0.9,<0.10` from PyPI, so any lnpl 0.9.x
+release works. 0.9.0 is the first lnpl release with
 `RepositoryDriver.supports_idempotency()` and the `RepositoryDriverTCK` cases
-that check the idempotency methods, so an older pin cannot verify them.
+that check the idempotency methods, so an older lnpl cannot verify them.
+
+The `linkly-sync` workflow checks two things on every PR:
+
+- `latest-release` fails when PyPI has a newer lnpl that this range excludes
+  (for example 0.10.0). Then widen the upper bound, run the suite, and release.
+- `latest-main` runs the suite against linkly's `main`, so a break shows up
+  before linkly releases it.
+
+## Releasing
+
+1. Set `version` in `pyproject.toml` and merge that to `main`.
+2. Tag the merge commit `v<version>` and push the tag.
+3. `release.yml` runs the suite, builds the sdist and wheel, and publishes them
+   to PyPI through Trusted Publishing. The PyPI publisher is: project
+   `lnpl-postgres`, owner `choiyounggi`, repository `lnpl-postgres`, workflow
+   `release.yml`, environment `pypi`.
+
+PyPI never accepts the same version twice. If the publish job fails for an
+outside reason (PyPI outage, publisher not registered), re-run only that job
+with `gh run rerun <run-id> --failed`. If the cause is in this repo, fix it on
+`main` and release the next patch version. Never delete or re-push a tag.

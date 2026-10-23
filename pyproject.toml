@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "PostgreSQL RepositoryDriver for lnpl (linkly#121)"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
-    "lnpl @ git+https://github.com/choiyounggi/linkly@b1cd52354df6d935286f8dc089b9ee1bcb87e673",
+    "lnpl>=0.9,<0.10",
     "psycopg[binary,pool]>=3.2,<3.3",
 ]
 
 [project.optional-dependencies]
-test = ["testcontainers[postgres]>=4.15,<5"]
+test = ["testcontainers[postgres]>=4.15,<5", "packaging>=24"]
 
 [project.entry-points."lnpl.drivers"]
 postgres = "lnpl_postgres:make_driver"
